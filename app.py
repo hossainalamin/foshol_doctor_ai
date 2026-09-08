@@ -6,6 +6,8 @@ import torch.nn as nn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from PIL import Image
 from torchvision import models, transforms
+import joblib
+from pydantic import BaseModel
 
 
 # =====================================================
@@ -17,6 +19,12 @@ app = FastAPI(
     version="1.0"
 )
 
+# =====================================================
+# Request Models
+# =====================================================
+
+class TextPredictionRequest(BaseModel):
+    text: str
 
 # =====================================================
 # Configuration
@@ -27,11 +35,12 @@ DEVICE = torch.device(
 )
 
 MODEL_PATH = "models/mobilenetv3_finetuned_best.pth"
+TEXT_MODEL_PATH = "models/bangla_text_model.joblib"
 CONFIDENCE_THRESHOLD = 70.0
 
 
 # =====================================================
-# Load Saved Model
+# Load Image Model
 # =====================================================
 
 checkpoint = torch.load(
@@ -69,6 +78,16 @@ print("AI Model loaded successfully")
 print("Device:", DEVICE)
 print("Classes:", class_names)
 
+# =====================================================
+# Load Bangla Text Model
+# =====================================================
+
+text_model = joblib.load(
+    TEXT_MODEL_PATH
+)
+
+print("Bangla text model loaded successfully")
+
 
 # =====================================================
 # Image Preprocessing
@@ -105,7 +124,7 @@ def health_check():
 # Predict API
 # =====================================================
 
-@app.post("/predict")
+@app.post("/predict/image")
 async def predict(
     image: UploadFile = File(...)
 ):
@@ -185,5 +204,36 @@ async def predict(
             confidence_value,
             2
         ),
+        "needsExpertReview": needs_expert_review
+    }
+@app.post("/predict/text")
+def predict_text(request: TextPredictionRequest):
+
+    text = request.text.strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty."
+        )
+
+    probabilities = text_model.predict_proba([text])[0]
+    classes = text_model.classes_
+
+    best_index = int(probabilities.argmax())
+
+    disease = str(classes[best_index])
+
+    confidence = float(
+        probabilities[best_index] * 100
+    )
+
+    needs_expert_review = bool(
+        confidence < CONFIDENCE_THRESHOLD
+    )
+
+    return {
+        "disease": disease,
+        "confidence": round(confidence, 2),
         "needsExpertReview": needs_expert_review
     }
