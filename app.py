@@ -5,6 +5,8 @@ import secrets
 import joblib
 import torch
 import torch.nn as nn
+import cv2
+import numpy as np
 
 from dotenv import load_dotenv
 
@@ -123,8 +125,43 @@ def verify_api_key(
         )
 
     return api_key
+# =====================================================
+# Check Image Quality
+# =====================================================
+def check_image_quality(pil_image):
 
+    image = np.array(pil_image)
 
+    # Minimum size
+    height, width = image.shape[:2]
+
+    if width < 224 or height < 224:
+        return False, "ছবির resolution খুব কম। পরিষ্কার ছবি তুলুন।"
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_RGB2GRAY
+    )
+
+    # Blur check
+    blur_score = cv2.Laplacian(
+        gray,
+        cv2.CV_64F
+    ).var()
+
+    if blur_score < 80:
+        return False, "ছবিটি অস্পষ্ট। আবার পরিষ্কার ছবি তুলুন।"
+
+    # Brightness check
+    brightness = gray.mean()
+
+    if brightness < 45:
+        return False, "ছবিটি অনেক অন্ধকার। আলোতে আবার ছবি তুলুন।"
+
+    if brightness > 225:
+        return False, "ছবিটি অতিরিক্ত উজ্জ্বল। আবার ছবি তুলুন।"
+
+    return True, None
 # =====================================================
 # Load Image Model
 # =====================================================
@@ -289,27 +326,28 @@ async def predict_image(
     # -----------------------------------------
 
     try:
-
         contents = await image.read()
 
-
         pil_image = Image.open(
-            BytesIO(
-                contents
-            )
-        ).convert(
-            "RGB"
-        )
-
+            BytesIO(contents)
+        ).convert("RGB")
 
     except Exception as exc:
-
         raise HTTPException(
             status_code=400,
-            detail=(
-                "ছবিটি পড়া সম্ভব হয়নি।"
-            )
+            detail="ছবিটি পড়া সম্ভব হয়নি।"
         ) from exc
+
+    # Quality check MUST be outside try/except
+    is_valid, error_message = check_image_quality(
+        pil_image
+    )
+
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail=error_message
+        )
 
 
     # -----------------------------------------
