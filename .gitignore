@@ -10,3 +10,5 @@ dataset/
 *.zip
 *.7z
 models/mobilenetv3_best.pth
+
+.env

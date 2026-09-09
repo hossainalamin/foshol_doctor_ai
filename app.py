@@ -1,13 +1,33 @@
 from io import BytesIO
+import os
+import secrets
 
+import joblib
 import torch
 import torch.nn as nn
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from dotenv import load_dotenv
+
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException,
+    Security
+)
+
+from fastapi.security import APIKeyHeader
+
 from PIL import Image
-from torchvision import models, transforms
-import joblib
 from pydantic import BaseModel
+from torchvision import models, transforms
+
+
+# =====================================================
+# Load Environment Variables
+# =====================================================
+
+load_dotenv()
 
 
 # =====================================================
@@ -16,8 +36,24 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="Fasol Doctor AI API",
-    version="1.0"
+    version="1.0",
+    description="AI API for rice disease prediction using image and Bangla text."
 )
+
+
+# =====================================================
+# Disease Bangla Mapping
+# =====================================================
+
+DISEASE_BN = {
+    "Blast": "ব্লাস্ট",
+    "Brown spot": "ব্রাউন স্পট",
+    "Healthy": "সুস্থ",
+    "Leaf smut": "লিফ স্মাট",
+    "Rice Tungro": "রাইস টুংরো",
+    "Sheath blight": "শীথ ব্লাইট"
+}
+
 
 # =====================================================
 # Request Models
@@ -25,6 +61,7 @@ app = FastAPI(
 
 class TextPredictionRequest(BaseModel):
     text: str
+
 
 # =====================================================
 # Configuration
@@ -34,9 +71,58 @@ DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-MODEL_PATH = "models/mobilenetv3_finetuned_best.pth"
-TEXT_MODEL_PATH = "models/bangla_text_model.joblib"
+IMAGE_MODEL_PATH = (
+    "models/mobilenetv3_finetuned_best.pth"
+)
+
+TEXT_MODEL_PATH = (
+    "models/bangla_text_model.joblib"
+)
+
 CONFIDENCE_THRESHOLD = 70.0
+
+
+# =====================================================
+# API Key Configuration
+# =====================================================
+
+API_KEY = os.getenv(
+    "FASOL_API_KEY"
+)
+
+if not API_KEY:
+    raise RuntimeError(
+        "FASOL_API_KEY is not configured. "
+        "Please add it to the .env file."
+    )
+
+
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False
+)
+
+
+def verify_api_key(
+    api_key: str = Security(
+        api_key_header
+    )
+):
+
+    if (
+        api_key is None
+        or not secrets.compare_digest(
+            api_key,
+            API_KEY
+        )
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail="অবৈধ অথবা অনুপস্থিত API Key।"
+        )
+
+    return api_key
 
 
 # =====================================================
@@ -44,11 +130,13 @@ CONFIDENCE_THRESHOLD = 70.0
 # =====================================================
 
 checkpoint = torch.load(
-    MODEL_PATH,
+    IMAGE_MODEL_PATH,
     map_location=DEVICE
 )
 
-class_names = checkpoint["class_names"]
+class_names = checkpoint[
+    "class_names"
+]
 
 IMAGE_SIZE = checkpoint.get(
     "image_size",
@@ -56,27 +144,52 @@ IMAGE_SIZE = checkpoint.get(
 )
 
 
-model = models.mobilenet_v3_small(
-    weights=None
+image_model = (
+    models.mobilenet_v3_small(
+        weights=None
+    )
 )
 
-model.classifier[3] = nn.Linear(
-    model.classifier[3].in_features,
-    len(class_names)
+
+image_model.classifier[3] = (
+    nn.Linear(
+        image_model
+        .classifier[3]
+        .in_features,
+
+        len(class_names)
+    )
 )
 
-model.load_state_dict(
-    checkpoint["model_state_dict"]
+
+image_model.load_state_dict(
+    checkpoint[
+        "model_state_dict"
+    ]
 )
 
-model = model.to(DEVICE)
 
-model.eval()
+image_model = image_model.to(
+    DEVICE
+)
+
+image_model.eval()
 
 
-print("AI Model loaded successfully")
-print("Device:", DEVICE)
-print("Classes:", class_names)
+print(
+    "Image AI model loaded successfully"
+)
+
+print(
+    "Device:",
+    DEVICE
+)
+
+print(
+    "Classes:",
+    class_names
+)
+
 
 # =====================================================
 # Load Bangla Text Model
@@ -86,23 +199,39 @@ text_model = joblib.load(
     TEXT_MODEL_PATH
 )
 
-print("Bangla text model loaded successfully")
+
+print(
+    "Bangla text model loaded successfully"
+)
 
 
 # =====================================================
 # Image Preprocessing
 # =====================================================
 
-transform = transforms.Compose([
+image_transform = transforms.Compose([
+
     transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
+        (
+            IMAGE_SIZE,
+            IMAGE_SIZE
+        )
     ),
 
     transforms.ToTensor(),
 
     transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        mean=[
+            0.485,
+            0.456,
+            0.406
+        ],
+
+        std=[
+            0.229,
+            0.224,
+            0.225
+        ]
     )
 ])
 
@@ -121,119 +250,287 @@ def health_check():
 
 
 # =====================================================
-# Predict API
+# Image Prediction API
 # =====================================================
 
 @app.post("/predict/image")
-async def predict(
-    image: UploadFile = File(...)
+async def predict_image(
+
+    image: UploadFile = File(...),
+
+    api_key: str = Security(
+        verify_api_key
+    )
+
 ):
 
-    # Check file type
-    if not image.content_type.startswith("image/"):
+    # -----------------------------------------
+    # Validate Image
+    # -----------------------------------------
+
+    if (
+        image.content_type is None
+        or not image.content_type.startswith(
+            "image/"
+        )
+    ):
 
         raise HTTPException(
             status_code=400,
-            detail="Please upload a valid image file."
+            detail=(
+                "অনুগ্রহ করে একটি সঠিক "
+                "ছবি আপলোড করুন।"
+            )
         )
 
+
+    # -----------------------------------------
+    # Read Image
+    # -----------------------------------------
 
     try:
 
         contents = await image.read()
 
-        pil_image = Image.open(
-            BytesIO(contents)
-        ).convert("RGB")
 
-    except Exception:
+        pil_image = Image.open(
+            BytesIO(
+                contents
+            )
+        ).convert(
+            "RGB"
+        )
+
+
+    except Exception as exc:
 
         raise HTTPException(
             status_code=400,
-            detail="Unable to read image."
+            detail=(
+                "ছবিটি পড়া সম্ভব হয়নি।"
+            )
+        ) from exc
+
+
+    # -----------------------------------------
+    # Image Preprocessing
+    # -----------------------------------------
+
+    input_tensor = (
+        image_transform(
+            pil_image
         )
-
-
-    # Preprocess
-    input_tensor = transform(
-        pil_image
-    ).unsqueeze(0)
-
-    input_tensor = input_tensor.to(
-        DEVICE
+        .unsqueeze(0)
+        .to(DEVICE)
     )
 
 
+    # -----------------------------------------
     # Prediction
+    # -----------------------------------------
+
     with torch.no_grad():
 
-        output = model(
+        output = image_model(
             input_tensor
         )
 
-        probabilities = torch.softmax(
-            output,
-            dim=1
+
+        probabilities = (
+            torch.softmax(
+                output,
+                dim=1
+            )[0]
         )
 
-        confidence, predicted = torch.max(
-            probabilities,
-            1
-        )
+
+    # -----------------------------------------
+    # Best Prediction
+    # -----------------------------------------
+
+    best_index = int(
+        torch.argmax(
+            probabilities
+        ).item()
+    )
 
 
-    disease = class_names[
-        predicted.item()
-    ]
+    disease_en = str(
+        class_names[
+            best_index
+        ]
+    )
 
-    confidence_value = (
-        confidence.item()
+
+    disease_bn = DISEASE_BN.get(
+        disease_en,
+        disease_en
+    )
+
+
+    confidence = float(
+        probabilities[
+            best_index
+        ].item()
         * 100
     )
 
 
-    needs_expert_review = (
-        confidence_value
+    needs_expert_review = bool(
+        confidence
         < CONFIDENCE_THRESHOLD
     )
 
 
+    # -----------------------------------------
+    # Message
+    # -----------------------------------------
+
+    if needs_expert_review:
+
+        message = (
+            "রোগ শনাক্তকরণে AI যথেষ্ট নিশ্চিত নয়। "
+            "বিশেষজ্ঞের পরামর্শ নিন।"
+        )
+
+    else:
+
+        message = (
+            "রোগটি সফলভাবে শনাক্ত করা হয়েছে।"
+        )
+
+
+    # -----------------------------------------
+    # Response
+    # -----------------------------------------
+
     return {
-        "disease": disease,
+
+        "disease": disease_bn,
+
         "confidence": round(
-            confidence_value,
+            confidence,
             2
         ),
-        "needsExpertReview": needs_expert_review
+
+        "needsExpertReview":
+            needs_expert_review,
+
+        "message": message
     }
+
+
+# =====================================================
+# Bangla Text Prediction API
+# =====================================================
+
 @app.post("/predict/text")
-def predict_text(request: TextPredictionRequest):
+def predict_text(
+
+    request: TextPredictionRequest,
+
+    api_key: str = Security(
+        verify_api_key
+    )
+
+):
+
+    # -----------------------------------------
+    # Validate Text
+    # -----------------------------------------
 
     text = request.text.strip()
 
+
     if not text:
+
         raise HTTPException(
             status_code=400,
-            detail="Text cannot be empty."
+            detail="লক্ষণ লিখুন।"
         )
 
-    probabilities = text_model.predict_proba([text])[0]
-    classes = text_model.classes_
 
-    best_index = int(probabilities.argmax())
+    # -----------------------------------------
+    # Prediction
+    # -----------------------------------------
 
-    disease = str(classes[best_index])
+    probabilities = (
+        text_model.predict_proba(
+            [text]
+        )[0]
+    )
+
+
+    classes = (
+        text_model.classes_
+    )
+
+
+    best_index = int(
+        probabilities.argmax()
+    )
+
+
+    disease_en = str(
+        classes[
+            best_index
+        ]
+    )
+
+
+    disease_bn = DISEASE_BN.get(
+        disease_en,
+        disease_en
+    )
+
 
     confidence = float(
-        probabilities[best_index] * 100
+        probabilities[
+            best_index
+        ]
+        * 100
     )
+
 
     needs_expert_review = bool(
-        confidence < CONFIDENCE_THRESHOLD
+        confidence
+        < CONFIDENCE_THRESHOLD
     )
 
+
+    # -----------------------------------------
+    # Message
+    # -----------------------------------------
+
+    if needs_expert_review:
+
+        message = (
+            "রোগ শনাক্তকরণে AI যথেষ্ট নিশ্চিত নয়। "
+            "বিশেষজ্ঞের পরামর্শ নিন।"
+        )
+
+    else:
+
+        message = (
+            "রোগটি সফলভাবে শনাক্ত করা হয়েছে।"
+        )
+
+
+    # -----------------------------------------
+    # Response
+    # -----------------------------------------
+
     return {
-        "disease": disease,
-        "confidence": round(confidence, 2),
-        "needsExpertReview": needs_expert_review
+
+        "disease": disease_bn,
+
+        "confidence": round(
+            confidence,
+            2
+        ),
+
+        "needsExpertReview":
+            needs_expert_review,
+
+        "message": message
     }
