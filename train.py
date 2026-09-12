@@ -83,12 +83,12 @@ val_transform = transforms.Compose([
 # =====================================================
 
 train_dataset = datasets.ImageFolder(
-    "dataset/train",
+    "dataset/rice_clean/train",
     transform=train_transform
 )
 
 val_dataset = datasets.ImageFolder(
-    "dataset/val",
+    "dataset/rice_clean/val",
     transform=val_transform
 )
 
