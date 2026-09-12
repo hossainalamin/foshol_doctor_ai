@@ -2,31 +2,22 @@ from io import BytesIO
 import os
 import secrets
 
+import cv2
 import joblib
+import numpy as np
 import torch
 import torch.nn as nn
-import cv2
-import numpy as np
 
 from dotenv import load_dotenv
-
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException,
-    Security
-)
-
+from fastapi import FastAPI, File, HTTPException, Security, UploadFile
 from fastapi.security import APIKeyHeader
-
 from PIL import Image
 from pydantic import BaseModel
 from torchvision import models, transforms
 
 
 # =====================================================
-# Load Environment Variables
+# Environment
 # =====================================================
 
 load_dotenv()
@@ -38,8 +29,11 @@ load_dotenv()
 
 app = FastAPI(
     title="Fasol Doctor AI API",
-    version="1.0",
-    description="AI API for rice disease prediction using image and Bangla text."
+    version="1.1",
+    description=(
+        "AI API for rice and eggplant disease prediction "
+        "using images and Bangla text."
+    ),
 )
 
 
@@ -47,13 +41,23 @@ app = FastAPI(
 # Disease Bangla Mapping
 # =====================================================
 
-DISEASE_BN = {
+RICE_DISEASE_BN = {
     "Blast": "ব্লাস্ট",
     "Brown spot": "ব্রাউন স্পট",
     "Healthy": "সুস্থ",
     "Leaf smut": "লিফ স্মাট",
     "Rice Tungro": "রাইস টুংরো",
-    "Sheath blight": "শীথ ব্লাইট"
+    "Sheath blight": "শীথ ব্লাইট",
+}
+
+EGGPLANT_DISEASE_BN = {
+    "Healthy Leaf": "সুস্থ পাতা",
+    "Insect Pest Disease": "পোকামাকড়ের আক্রমণ",
+    "Leaf Spot Disease": "পাতার দাগ রোগ",
+    "Mosaic Virus Disease": "মোজাইক ভাইরাস রোগ",
+    "Small Leaf Disease": "ছোট পাতা রোগ",
+    "White Mold Disease": "হোয়াইট মোল্ড রোগ",
+    "Wilt Disease": "ঢলে পড়া রোগ",
 }
 
 
@@ -69,90 +73,67 @@ class TextPredictionRequest(BaseModel):
 # Configuration
 # =====================================================
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-IMAGE_MODEL_PATH = (
-    "models/mobilenetv3_finetuned_best.pth"
-)
-
-TEXT_MODEL_PATH = (
-    "models/bangla_text_model.joblib"
-)
+RICE_IMAGE_MODEL_PATH = "models/mobilenetv3_finetuned_best.pth"
+EGGPLANT_IMAGE_MODEL_PATH = "models/mobilenetv3_eggplant_best.pth"
+RICE_TEXT_MODEL_PATH = "models/bangla_text_model.joblib"
+EGGPLANT_TEXT_MODEL_PATH = "models/bangla_eggplant_text_model.joblib"
 
 CONFIDENCE_THRESHOLD = 70.0
+DEFAULT_IMAGE_SIZE = 224
 
 
 # =====================================================
 # API Key Configuration
 # =====================================================
 
-API_KEY = os.getenv(
-    "FASOL_API_KEY"
-)
+API_KEY = os.getenv("FASOL_API_KEY")
 
 if not API_KEY:
     raise RuntimeError(
-        "FASOL_API_KEY is not configured. "
-        "Please add it to the .env file."
+        "FASOL_API_KEY is not configured. Please add it to the .env file."
     )
-
 
 api_key_header = APIKeyHeader(
     name="X-API-Key",
-    auto_error=False
+    auto_error=False,
 )
 
 
-def verify_api_key(
-    api_key: str = Security(
-        api_key_header
-    )
-):
-
-    if (
-        api_key is None
-        or not secrets.compare_digest(
-            api_key,
-            API_KEY
-        )
-    ):
-
+def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key is None or not secrets.compare_digest(api_key, API_KEY):
         raise HTTPException(
             status_code=401,
-            detail="অবৈধ অথবা অনুপস্থিত API Key।"
+            detail="অবৈধ অথবা অনুপস্থিত API Key।",
         )
 
     return api_key
-# =====================================================
-# Check Image Quality
-# =====================================================
-def check_image_quality(pil_image):
 
+
+# =====================================================
+# Image Quality Check
+# =====================================================
+
+
+def check_image_quality(pil_image: Image.Image):
     image = np.array(pil_image)
 
-    # Minimum size
     height, width = image.shape[:2]
 
     if width < 224 or height < 224:
         return False, "ছবির resolution খুব কম। পরিষ্কার ছবি তুলুন।"
 
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_RGB2GRAY
-    )
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
-    # Blur check
     blur_score = cv2.Laplacian(
         gray,
-        cv2.CV_64F
+        cv2.CV_64F,
     ).var()
 
     if blur_score < 80:
         return False, "ছবিটি অস্পষ্ট। আবার পরিষ্কার ছবি তুলুন।"
 
-    # Brightness check
     brightness = gray.mean()
 
     if brightness < 45:
@@ -162,172 +143,138 @@ def check_image_quality(pil_image):
         return False, "ছবিটি অতিরিক্ত উজ্জ্বল। আবার ছবি তুলুন।"
 
     return True, None
+
+
 # =====================================================
-# Load Image Model
+# Model Loader
 # =====================================================
 
-checkpoint = torch.load(
-    IMAGE_MODEL_PATH,
-    map_location=DEVICE
-)
 
-class_names = checkpoint[
-    "class_names"
-]
-
-IMAGE_SIZE = checkpoint.get(
-    "image_size",
-    224
-)
-
-
-image_model = (
-    models.mobilenet_v3_small(
-        weights=None
+def load_mobilenet_model(model_path: str):
+    checkpoint = torch.load(
+        model_path,
+        map_location=DEVICE,
     )
-)
 
+    # Rice checkpoint uses "class_names".
+    # Eggplant training checkpoint uses "classes".
+    class_names = checkpoint.get("class_names")
 
-image_model.classifier[3] = (
-    nn.Linear(
-        image_model
-        .classifier[3]
-        .in_features,
+    if class_names is None:
+        class_names = checkpoint.get("classes")
 
-        len(class_names)
+    if class_names is None:
+        raise RuntimeError(
+            f"No class list found in checkpoint: {model_path}"
+        )
+
+    image_size = checkpoint.get(
+        "image_size",
+        DEFAULT_IMAGE_SIZE,
     )
-)
 
+    model = models.mobilenet_v3_small(
+        weights=None,
+    )
 
-image_model.load_state_dict(
-    checkpoint[
-        "model_state_dict"
-    ]
-)
+    model.classifier[3] = nn.Linear(
+        model.classifier[3].in_features,
+        len(class_names),
+    )
 
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
 
-image_model = image_model.to(
-    DEVICE
-)
+    model = model.to(DEVICE)
+    model.eval()
 
-image_model.eval()
-
-
-print(
-    "Image AI model loaded successfully"
-)
-
-print(
-    "Device:",
-    DEVICE
-)
-
-print(
-    "Classes:",
-    class_names
-)
+    return model, list(class_names), image_size
 
 
 # =====================================================
-# Load Bangla Text Model
+# Load Rice Image Model
 # =====================================================
 
-text_model = joblib.load(
-    TEXT_MODEL_PATH
+rice_image_model, rice_class_names, rice_image_size = load_mobilenet_model(
+    RICE_IMAGE_MODEL_PATH
 )
 
+print("Rice image model loaded successfully")
+print("Rice classes:", rice_class_names)
 
-print(
-    "Bangla text model loaded successfully"
+
+# =====================================================
+# Load Eggplant Image Model
+# =====================================================
+
+eggplant_image_model, eggplant_class_names, eggplant_image_size = load_mobilenet_model(
+    EGGPLANT_IMAGE_MODEL_PATH
 )
+
+print("Eggplant image model loaded successfully")
+print("Eggplant classes:", eggplant_class_names)
+
+
+# =====================================================
+# Load Bangla Text Models
+# =====================================================
+
+rice_text_model = joblib.load(
+    RICE_TEXT_MODEL_PATH
+)
+
+eggplant_text_model = joblib.load(
+    EGGPLANT_TEXT_MODEL_PATH
+)
+
+print("Rice Bangla text model loaded successfully")
+print("Eggplant Bangla text model loaded successfully")
+print("Device:", DEVICE)
 
 
 # =====================================================
 # Image Preprocessing
 # =====================================================
 
-image_transform = transforms.Compose([
 
-    transforms.Resize(
-        (
-            IMAGE_SIZE,
-            IMAGE_SIZE
-        )
-    ),
+def build_image_transform(image_size: int):
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
 
-    transforms.ToTensor(),
 
-    transforms.Normalize(
-        mean=[
-            0.485,
-            0.456,
-            0.406
-        ],
+rice_image_transform = build_image_transform(
+    rice_image_size
+)
 
-        std=[
-            0.229,
-            0.224,
-            0.225
-        ]
-    )
-])
+eggplant_image_transform = build_image_transform(
+    eggplant_image_size
+)
 
 
 # =====================================================
-# Health API
+# Shared Image Helpers
 # =====================================================
 
-@app.get("/health")
-def health_check():
 
-    return {
-        "status": "ok",
-        "service": "Fasol Doctor AI"
-    }
-
-
-# =====================================================
-# Image Prediction API
-# =====================================================
-
-@app.post("/predict/image")
-async def predict_image(
-
-    image: UploadFile = File(...),
-
-    api_key: str = Security(
-        verify_api_key
-    )
-
-):
-
-    # -----------------------------------------
-    # Validate Image
-    # -----------------------------------------
-
+async def read_uploaded_image(image: UploadFile) -> Image.Image:
     if (
         image.content_type is None
-        or not image.content_type.startswith(
-            "image/"
-        )
+        or not image.content_type.startswith("image/")
     ):
-
         raise HTTPException(
             status_code=400,
-            detail=(
-                "অনুগ্রহ করে একটি সঠিক "
-                "ছবি আপলোড করুন।"
-            )
+            detail="অনুগ্রহ করে একটি সঠিক ছবি আপলোড করুন।",
         )
-
-
-    # -----------------------------------------
-    # Read Image
-    # -----------------------------------------
 
     try:
         contents = await image.read()
-
         pil_image = Image.open(
             BytesIO(contents)
         ).convert("RGB")
@@ -335,10 +282,9 @@ async def predict_image(
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail="ছবিটি পড়া সম্ভব হয়নি।"
+            detail="ছবিটি পড়া সম্ভব হয়নি।",
         ) from exc
 
-    # Quality check MUST be outside try/except
     is_valid, error_message = check_image_quality(
         pil_image
     )
@@ -346,229 +292,226 @@ async def predict_image(
     if not is_valid:
         raise HTTPException(
             status_code=400,
-            detail=error_message
+            detail=error_message,
         )
 
+    return pil_image
 
-    # -----------------------------------------
-    # Image Preprocessing
-    # -----------------------------------------
 
+def predict_with_image_model(
+    pil_image: Image.Image,
+    model,
+    image_transform,
+    class_names,
+    disease_mapping,
+):
     input_tensor = (
-        image_transform(
-            pil_image
-        )
+        image_transform(pil_image)
         .unsqueeze(0)
         .to(DEVICE)
     )
 
-
-    # -----------------------------------------
-    # Prediction
-    # -----------------------------------------
-
     with torch.no_grad():
-
-        output = image_model(
-            input_tensor
-        )
-
-
-        probabilities = (
-            torch.softmax(
-                output,
-                dim=1
-            )[0]
-        )
-
-
-    # -----------------------------------------
-    # Best Prediction
-    # -----------------------------------------
+        output = model(input_tensor)
+        probabilities = torch.softmax(
+            output,
+            dim=1,
+        )[0]
 
     best_index = int(
-        torch.argmax(
-            probabilities
-        ).item()
+        torch.argmax(probabilities).item()
     )
-
 
     disease_en = str(
-        class_names[
-            best_index
-        ]
+        class_names[best_index]
     )
 
-
-    disease_bn = DISEASE_BN.get(
+    disease_bn = disease_mapping.get(
         disease_en,
-        disease_en
+        disease_en,
     )
-
 
     confidence = float(
-        probabilities[
-            best_index
-        ].item()
+        probabilities[best_index].item()
         * 100
     )
 
-
     needs_expert_review = bool(
-        confidence
-        < CONFIDENCE_THRESHOLD
+        confidence < CONFIDENCE_THRESHOLD
     )
 
-
-    # -----------------------------------------
-    # Message
-    # -----------------------------------------
-
     if needs_expert_review:
-
         message = (
             "রোগ শনাক্তকরণে AI যথেষ্ট নিশ্চিত নয়। "
             "বিশেষজ্ঞের পরামর্শ নিন।"
         )
-
     else:
-
-        message = (
-            "রোগটি সফলভাবে শনাক্ত করা হয়েছে।"
-        )
-
-
-    # -----------------------------------------
-    # Response
-    # -----------------------------------------
+        message = "রোগটি সফলভাবে শনাক্ত করা হয়েছে।"
 
     return {
-
         "disease": disease_bn,
-
-        "confidence": round(
-            confidence,
-            2
-        ),
-
-        "needsExpertReview":
-            needs_expert_review,
-
-        "message": message
+        "confidence": round(confidence, 2),
+        "needsExpertReview": needs_expert_review,
+        "message": message,
     }
 
 
 # =====================================================
-# Bangla Text Prediction API
+# Health API
 # =====================================================
 
-@app.post("/predict/text")
-def predict_text(
 
-    request: TextPredictionRequest,
+@app.get("/health")
+def health_check():
+    return {
+        "status": "ok",
+        "service": "Fasol Doctor AI",
+    }
 
-    api_key: str = Security(
-        verify_api_key
-    )
 
+# =====================================================
+# Rice Image Prediction API
+# Existing endpoint kept for app compatibility
+# =====================================================
+
+
+@app.post("/predict/image")
+async def predict_rice_image(
+    image: UploadFile = File(...),
+    api_key: str = Security(verify_api_key),
 ):
+    pil_image = await read_uploaded_image(image)
 
-    # -----------------------------------------
-    # Validate Text
-    # -----------------------------------------
-
-    text = request.text.strip()
-
-
-    if not text:
-
-        raise HTTPException(
-            status_code=400,
-            detail="লক্ষণ লিখুন।"
-        )
-
-
-    # -----------------------------------------
-    # Prediction
-    # -----------------------------------------
-
-    probabilities = (
-        text_model.predict_proba(
-            [text]
-        )[0]
+    return predict_with_image_model(
+        pil_image=pil_image,
+        model=rice_image_model,
+        image_transform=rice_image_transform,
+        class_names=rice_class_names,
+        disease_mapping=RICE_DISEASE_BN,
     )
 
 
-    classes = (
-        text_model.classes_
+# =====================================================
+# Eggplant Image Prediction API
+# =====================================================
+
+
+@app.post("/predict/eggplant/image")
+async def predict_eggplant_image(
+    image: UploadFile = File(...),
+    api_key: str = Security(verify_api_key),
+):
+    pil_image = await read_uploaded_image(image)
+
+    return predict_with_image_model(
+        pil_image=pil_image,
+        model=eggplant_image_model,
+        image_transform=eggplant_image_transform,
+        class_names=eggplant_class_names,
+        disease_mapping=EGGPLANT_DISEASE_BN,
     )
 
+
+# =====================================================
+# Shared Text Prediction Helper
+# =====================================================
+
+
+def predict_with_text_model(
+    text: str,
+    model,
+    disease_mapping,
+):
+    probabilities = model.predict_proba(
+        [text]
+    )[0]
+
+    classes = model.classes_
 
     best_index = int(
         probabilities.argmax()
     )
 
-
     disease_en = str(
-        classes[
-            best_index
-        ]
+        classes[best_index]
     )
 
-
-    disease_bn = DISEASE_BN.get(
+    disease_bn = disease_mapping.get(
         disease_en,
-        disease_en
+        disease_en,
     )
-
 
     confidence = float(
-        probabilities[
-            best_index
-        ]
+        probabilities[best_index]
         * 100
     )
 
-
     needs_expert_review = bool(
-        confidence
-        < CONFIDENCE_THRESHOLD
+        confidence < CONFIDENCE_THRESHOLD
     )
 
-
-    # -----------------------------------------
-    # Message
-    # -----------------------------------------
-
     if needs_expert_review:
-
         message = (
             "রোগ শনাক্তকরণে AI যথেষ্ট নিশ্চিত নয়। "
             "বিশেষজ্ঞের পরামর্শ নিন।"
         )
-
     else:
-
-        message = (
-            "রোগটি সফলভাবে শনাক্ত করা হয়েছে।"
-        )
-
-
-    # -----------------------------------------
-    # Response
-    # -----------------------------------------
+        message = "রোগটি সফলভাবে শনাক্ত করা হয়েছে।"
 
     return {
-
         "disease": disease_bn,
-
-        "confidence": round(
-            confidence,
-            2
-        ),
-
-        "needsExpertReview":
-            needs_expert_review,
-
-        "message": message
+        "confidence": round(confidence, 2),
+        "needsExpertReview": needs_expert_review,
+        "message": message,
     }
+
+
+# =====================================================
+# Rice Bangla Text Prediction API
+# Existing endpoint kept for app compatibility
+# =====================================================
+
+
+@app.post("/predict/text")
+def predict_rice_text(
+    request: TextPredictionRequest,
+    api_key: str = Security(verify_api_key),
+):
+    text = request.text.strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="লক্ষণ লিখুন।",
+        )
+
+    return predict_with_text_model(
+        text=text,
+        model=rice_text_model,
+        disease_mapping=RICE_DISEASE_BN,
+    )
+
+
+# =====================================================
+# Eggplant Bangla Text Prediction API
+# =====================================================
+
+
+@app.post("/predict/eggplant/text")
+def predict_eggplant_text(
+    request: TextPredictionRequest,
+    api_key: str = Security(verify_api_key),
+):
+    text = request.text.strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="লক্ষণ লিখুন।",
+        )
+
+    return predict_with_text_model(
+        text=text,
+        model=eggplant_text_model,
+        disease_mapping=EGGPLANT_DISEASE_BN,
+    )
